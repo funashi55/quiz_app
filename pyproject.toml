@@ -17,6 +17,7 @@ onnxruntime = "1.19.2"
 langchain-chroma = "^0.1.4"
 wikipedia = "^1.4.0"
 fastapi = "^0.115.5"
+firecrawl-py = "^1.6.1"
 
 
 [build-system]

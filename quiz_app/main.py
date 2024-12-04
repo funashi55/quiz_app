@@ -1,22 +1,31 @@
+import os
+from contextlib import asynccontextmanager
+
+import wikipedia
 from dotenv import load_dotenv
-from langgraph.graph import MessagesState, START, END, StateGraph
-from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import AIMessage
 from langchain_core.output_parsers import StrOutputParser
-import wikipedia
-import os
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.graph import END, START, MessagesState, StateGraph
+from psycopg_pool import ConnectionPool
+from pydantic import BaseModel, Field
 
 load_dotenv()
+USER_NAME = os.environ["USER_NAME"]
+USER_PASS = os.environ["USER_PASS"]
 
 llm = ChatOpenAI(model="gpt-4o")
 
+
 ### インプットがクイズを生成して欲しいか答え合わせなのか判断するチェーン
 class InputType(BaseModel):
-    input_type: str = Field(description="ユーザーのメッセージがクイズの出題以来なら'question'、答え合わせの時は'answer'、ヒントを欲しがっている時は'hint'")
+    input_type: str = Field(
+        description="ユーザーのメッセージがクイズの出題以来なら'question'、答え合わせの時は'answer'、ヒントを欲しがっている時は'hint'"
+    )
+
 
 input_type_llm = llm.with_structured_output(InputType)
 
@@ -25,10 +34,7 @@ system = """ユーザーからのメッセージの内容と意図を理解し�
         """
 
 input_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system),
-        MessagesPlaceholder("messages")
-    ]
+    [("system", system), MessagesPlaceholder("messages")]
 )
 
 input_router = input_prompt | input_type_llm
@@ -39,10 +45,7 @@ system = """あなたはクイズの出題者としてユーザーの回答に�
         クイズの問題:{question}\n正しい答え:{answer}"""
 
 input_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system),
-        ("user", "{message}")
-    ]
+    [("system", system), ("user", "{message}")]
 )
 
 answer_teller = input_prompt | llm | StrOutputParser()
@@ -54,36 +57,34 @@ system = """あなたはクイズの出題者として、回答者のヒント�
         クイズの問題:{question}\n正しい答え:{answer}"""
 
 input_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system),
-        MessagesPlaceholder("messages")
-    ]
+    [("system", system), MessagesPlaceholder("messages")]
 )
 
 hint_generator = input_prompt | llm | StrOutputParser()
 
 ### インプットからジャンルを理解する
 
+
 class Genre(BaseModel):
     genre: str = Field(description="ユーザーがお題として欲しいクイズのジャンル")
+
 
 genre_llm = llm.with_structured_output(Genre)
 
 system = """あなたはユーザーのメッセージからどんなジャンルの問題を出題して欲しいのか理解します。\n。"""
 
 input_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system),
-        ("human", "{message}")
-    ]
+    [("system", system), ("human", "{message}")]
 )
 
 genre_getter = input_prompt | genre_llm
 
 ### wikipediaのクエリを生成するチェーン
 
+
 class WikipediaQuery(BaseModel):
     query: str = Field(description="wikipediaでの検索クエリ")
+
 
 query_llm = llm.with_structured_output(WikipediaQuery)
 
@@ -92,19 +93,18 @@ system = """あなたはクイズの問題を作るための情報収集をし�
     ただし、ユーザーの求めているジャンルから乖離しすぎないように注意してください。"""
 
 input_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", system),
-        ("human", "{message}")
-    ]
+    [("system", system), ("human", "{message}")]
 )
 
 query_creator = input_prompt | query_llm
 
 ### クイズ生成するチェーン
 
+
 class QuestionAndAnswer(BaseModel):
     question: str = Field(description="クイズの問題文")
     answer: str = Field(description="クイズの回答")
+
 
 quiz_llm = llm.with_structured_output(QuestionAndAnswer)
 
@@ -114,13 +114,14 @@ system = """あなたはクイズの問題考案者です。与えられたド�
 input_prompt = ChatPromptTemplate.from_messages(
     [
         ("system", system),
-        ("human", "ジャンル:{genre}, 取得されたドキュメント{document}")
+        ("human", "ジャンル:{genre}, 取得されたドキュメント{document}"),
     ]
 )
 
 quiz_generator = input_prompt | quiz_llm
 
 ### グラフの状態を定義するステート
+
 
 class GraphState(MessagesState):
     genre: str
@@ -137,8 +138,16 @@ def tell_answer(state):
     message = state["messages"][-1].content
     document = state["document"]
 
-    response = answer_teller.invoke({"message": message, "answer": answer, "question": question, "document": document})
+    response = answer_teller.invoke(
+        {
+            "message": message,
+            "answer": answer,
+            "question": question,
+            "document": document,
+        }
+    )
     return {"messages": AIMessage(response)}
+
 
 ### ジャンルを理解するnode
 def get_genre(state):
@@ -147,12 +156,14 @@ def get_genre(state):
     response = genre_getter.invoke({"message": message})
     return {"genre": response.genre}
 
+
 ### クエリを生成するnode
 def create_query(state):
     message = state["messages"][-1]
 
     response = query_creator.invoke({"message": message})
     return {"query": response.query}
+
 
 ### Wikipediaから情報を取得するnode
 def search_wikipedia(state):
@@ -163,13 +174,19 @@ def search_wikipedia(state):
 
     return {"document": document}
 
+
 ### クイズを生成するnode
 def quiz_generate(state):
     genre = state["genre"]
     document = state["document"]
 
-    response = quiz_generator.invoke({"genre": genre,"document": document})
-    return {"messages": response.question, "question": response.question, "answer": response.answer}
+    response = quiz_generator.invoke({"genre": genre, "document": document})
+    return {
+        "messages": response.question,
+        "question": response.question,
+        "answer": response.answer,
+    }
+
 
 ### ヒントを生成するnode
 def hint_generate(state):
@@ -178,9 +195,15 @@ def hint_generate(state):
     answer = state["answer"]
     messages = state["messages"]
 
-    response = hint_generator.invoke({"document": document, "question": question, "answer": answer, "messages": messages})
+    response = hint_generator.invoke(
+        {
+            "document": document,
+            "question": question,
+            "answer": answer,
+            "messages": messages,
+        }
+    )
     return {"messages": AIMessage(response)}
-
 
 
 ### ユーザーのメッセージを判断するedge
@@ -194,7 +217,8 @@ def router(state):
         return "tell answer"
     else:
         return "generate hint"
-    
+
+
 builder = StateGraph(GraphState)
 
 builder.add_node("get_genre", get_genre)
@@ -210,8 +234,8 @@ builder.add_conditional_edges(
     {
         "generate question": "get_genre",
         "tell answer": "tell_answer",
-        "generate hint": "hint_generate"
-    }
+        "generate hint": "hint_generate",
+    },
 )
 builder.add_edge("get_genre", "create_query")
 builder.add_edge("create_query", "search_wikipedia")
@@ -221,28 +245,57 @@ builder.add_edge("hint_generate", END)
 builder.add_edge("tell_answer", END)
 
 
-checkpointer = MemorySaver()
-graph = builder.compile(checkpointer=checkpointer)
-
 # このスクリプトファイルの位置を基準に保存先を指定
 current_file_path = os.path.abspath(__file__)  # このスクリプトの絶対パス
 parent_directory = os.path.dirname(os.path.dirname(current_file_path))  # 一つ上の階層
 images_directory = os.path.join(parent_directory, "images")  # imagesディレクトリ
 output_file_path = os.path.join(images_directory, "mermaid_graph.png")
 
+
+DB_URI = f"postgresql://{USER_NAME}:{USER_PASS}@127.0.0.1:5432/postgres?sslmode=disable"
+print(DB_URI)
+
+connection_kwargs = {
+    "autocommit": True,
+    "prepare_threshold": 0,
+}
+db_connection = ConnectionPool(conninfo=DB_URI, max_size=20, kwargs=connection_kwargs)
+checkpointer = PostgresSaver(db_connection)
+checkpointer.setup()
+
+graph = builder.compile(checkpointer=checkpointer)
+
 graph.get_graph().draw_mermaid_png(output_file_path=output_file_path)
+
+
+# サーバーを立ち上げた時にDBとの接続を開始・落とした時に切断
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    yield
+
+    if db_connection:
+        db_connection.close()
+
 
 app = FastAPI()
 
+
 class InputRequest(BaseModel):
     user_input: str
-    thread_id: int
+    thread_id: str
+
 
 @app.post("/llm")
 async def invoke(request: InputRequest):
-    result = graph.invoke({"messages": request.user_input}, {"configurable": {"thread_id": request.thread_id}})
+    result = graph.invoke(
+        {"messages": request.user_input},
+        {"configurable": {"thread_id": request.thread_id}},
+    )
     return {"responce": result["messages"][-1].content}
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0")
